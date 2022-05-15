@@ -845,6 +845,7 @@ class VRPDriver(NetworkDriver):
             results[local_intf].append(neighbor_dict)
         return results
 
+    @staticmethod
     def bgp_time_conversion(bgp_uptime):
         """
         Convert string time to seconds.
