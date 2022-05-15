@@ -845,6 +845,320 @@ class VRPDriver(NetworkDriver):
             results[local_intf].append(neighbor_dict)
         return results
 
+    def bgp_time_conversion(bgp_uptime):
+        """
+        Convert string time to seconds.
+        Examples
+        00:14:23
+        00:13:40
+        00:00:21
+        00:00:13
+        00:00:49
+        1d11h
+        1d17h
+        1w0d
+        8w5d
+        1y28w
+        never
+        """
+        bgp_uptime = bgp_uptime.strip()
+        uptime_letters = set(['w', 'h', 'd', 'm'])
+
+        if 'never' in bgp_uptime:
+            return -1
+        elif ':' in bgp_uptime:
+            times = bgp_uptime.split(":")
+            times = [int(x) for x in times]
+            hours, minutes, seconds = times
+            return (hours * 3600) + (minutes * 60) + seconds
+        # Check if any letters 'w', 'h', 'd' are in the time string
+        elif uptime_letters & set(bgp_uptime):
+            form0 = r'(\d+)h(\d+)m'  # 03h21m
+            form1 = r'(\d+)d(\d+)h'  # 1d17h
+            form2 = r'(\d+)w(\d+)d'  # 8w5d
+            form3 = r'(\d+)y(\d+)w'  # 1y28w
+            match = re.search(form0, bgp_uptime)
+            if match:
+                hours = int(match.group(1))
+                minutes = int(match.group(2))
+                return (hours * 3600) + (minutes * 60)
+            match = re.search(form1, bgp_uptime)
+            if match:
+                days = int(match.group(1))
+                hours = int(match.group(2))
+                return (days * DAY_SECONDS) + (hours * 3600)
+            match = re.search(form2, bgp_uptime)
+            if match:
+                weeks = int(match.group(1))
+                days = int(match.group(2))
+                return (weeks * WEEK_SECONDS) + (days * DAY_SECONDS)
+            match = re.search(form3, bgp_uptime)
+            if match:
+                years = int(match.group(1))
+                weeks = int(match.group(2))
+                return (years * YEAR_SECONDS) + (weeks * WEEK_SECONDS)
+        raise ValueError("Unexpected value for BGP uptime string: {}".format(bgp_uptime))
+
+    ## custom bgp config for VRP, reference:https://codingnetworks.blog/napalm-network-automation-python-collect-data-from-multiple-vendors/
+    def get_bgp_neighbors(self):
+        """
+        Returns a dictionary of dictionaries. The keys for the first dictionary will be the vrf
+        (global if no vrf). The inner dictionary will contain the following data for each vrf:
+
+          * router_id
+          * peers - another dictionary of dictionaries. Outer keys are the IPs of the neighbors. \
+            The inner keys are:
+             * local_as (int)
+             * remote_as (int)
+             * remote_id - peer router id
+             * is_up (True/False)
+             * is_enabled (True/False)
+             * description (string)
+             * uptime (int in seconds)
+             * address_family (dictionary) - A dictionary of address families available for the \
+               neighbor. So far it can be 'ipv4' or 'ipv6'
+                * received_prefixes (int)
+                * accepted_prefixes (int)
+                * sent_prefixes (int)
+
+            Note, if is_up is False and uptime has a positive value then this indicates the
+            uptime of the last active BGP session.
+
+            Example::
+
+                {
+                  "global": {
+                    "router_id": "10.0.1.1",
+                    "peers": {
+                      "10.0.0.2": {
+                        "local_as": 65000,
+                        "remote_as": 65000,
+                        "remote_id": "10.0.1.2",
+                        "is_up": True,
+                        "is_enabled": True,
+                        "description": "internal-2",
+                        "uptime": 4838400,
+                        "address_family": {
+                          "ipv4": {
+                            "sent_prefixes": 637213,
+                            "accepted_prefixes": 3142,
+                            "received_prefixes": 3142
+                          },
+                          "ipv6": {
+                            "sent_prefixes": 36714,
+                            "accepted_prefixes": 148,
+                            "received_prefixes": 148
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+        """
+        afi_supported = {
+        "Ipv6 Unicast" : "ipv6 unicast",
+        "Ipv4 Unicast" : "ipv4 unicast",
+        "Vpnv4 All" : "vpnv4 unicast",
+        "Vpnv6 All" : "vpnv6 unicast"
+        }
+        bgp_neighbors = {}
+        command_bgp = "display bgp all summary"
+        output = self.device.send_command(command_bgp)
+    
+        if output == "":
+            return bgp_neighbors
+
+        ASN_REGEX = r"[\d\.]+"
+        IP_ADDR_REGEX = r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+        IPV4_ADDR_REGEX = IP_ADDR_REGEX
+        IPV6_ADDR_REGEX_1 = r"::"
+        IPV6_ADDR_REGEX_2 = r"[0-9a-fA-F:]{1,39}::[0-9a-fA-F:]{1,39}"
+        IPV6_ADDR_REGEX_3 = r"[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,3}:" \
+                             r"[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,3}"
+        # Should validate IPv6 address using an IP address library after matching with this regex
+        IPV6_ADDR_REGEX = r"(?:{}|{}|{})".format(IPV6_ADDR_REGEX_1, IPV6_ADDR_REGEX_2, IPV6_ADDR_REGEX_3)
+        IPV4_OR_IPV6_REGEX = r"(?:{}|{})".format(IPV4_ADDR_REGEX, IPV6_ADDR_REGEX)
+        #Regular Expressions
+        re_separator = r"\n\s*(?=Address Family:\s*\w+)"
+        re_vpn_instance_separator = r"\n\s*(?=VPN-Instance\s+[-_a-zA-Z0-9]+)"
+    
+        re_address_family = r"Address Family:(?P<address_family>\w+\s\w+)"
+        re_global_router_id = r"BGP local router ID :\s+(?P<glob_router_id>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
+        re_global_local_as = r"Local AS number :\s+(?P<local_as>{})".format(ASN_REGEX)
+        re_vrf_router_id = r"VPN-Instance\s+(?P<vrf>[-_a-zA-Z0-9]+), [rR]outer ID\s+" \
+                              r"(?P<vrf_router_id>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
+        re_peers = r"(?P<peer_ip>({})|({}))\s+" \
+                   r"(?P<as>{})\s+\d+\s+\d+\s+\d+\s+(?P<updown_time>[a-zA-Z0-9:]+)\s+" \
+                   r"(?P<state>[a-zA-Z0-9\(\)]+)\s+(?P<received_prefixes>\d+)\s+(?P<adv_prefixes>\d+)".format(
+                            IPV4_ADDR_REGEX, IPV6_ADDR_REGEX, ASN_REGEX)
+    
+        re_remote_rid = r"Remote router ID\s+(?P<remote_rid>{})".format(IPV4_ADDR_REGEX)
+        re_peer_description = r"Peer's description:\s+\"(?P<peer_description>.*)\""
+        re_accepted_routes = r"Received active routes total:\s+(?P<accepted_routes>.*)"
+    
+        #Separation of AFIs
+        afi_list = re.split(re_separator, output, flags=re.M)
+        #return afi_list
+    
+        bgp_global_router_id = ""
+        bgp_global_local_as = ""
+        for afi in afi_list:
+        
+            match_afi = re.search(re_global_router_id,afi, flags=re.M)
+            match_local_as = re.search(re_global_local_as,afi, flags=re.M)
+            if match_afi is not None:
+                bgp_global_router_id = match_afi.group('glob_router_id')
+                bgp_global_local_as = match_local_as.group('local_as')
+             
+            match_afi = re.search(re_address_family, afi, flags=re.M)
+    
+            if match_afi is not None and any((s in match_afi.group('address_family') for s in ['Ipv4 Unicast','Ipv6 Unicast'])):
+            
+                bgp_neighbors.update({"global": {"router_id": bgp_global_router_id, "peers" : {}}})
+    
+                for peer in afi.splitlines():
+                
+                    match_peer = re.search(re_peers, peer, flags=re.M)
+                     
+                    if match_peer:
+                        peer_bgp_command = ""
+                        if "Ipv6" in match_afi.group('address_family'):
+                            peer_bgp_command = "display bgp ipv6 peer {} verbose".format(match_peer.group('peer_ip'))
+                        else:
+                            peer_bgp_command = "display bgp peer {} verbose".format(match_peer.group('peer_ip'))
+                         
+                        peer_detail = self.device.send_command(peer_bgp_command)
+    
+                        match_remote_rid = re.search(re_remote_rid, peer_detail, flags=re.M)
+                        match_peer_description = re.search(re_peer_description, peer_detail, flags=re.M)
+                        match_accepted_routes = re.search(re_accepted_routes,peer_detail, flags=re.M )                       
+
+                        bgp_neighbors["global"]["peers"].update( { 
+                        match_peer.group('peer_ip'): { 
+                        "local_as": int(bgp_global_local_as), 
+                        "remote_as": int(match_peer.group('as')), 
+                        "remote_id": "" if match_remote_rid is None else match_remote_rid.group('remote_rid'), 
+                        "is_up": True if "Established" in match_peer.group('state') else False, 
+                        "is_enabled": False if "Admin" in match_peer.group('state') else True, 
+                        "description": "" if match_peer_description is None else match_peer_description.group('peer_description'), 
+                        "uptime": int(self.bgp_time_conversion(match_peer.group('updown_time'))), 
+                        "address_family": { 
+                            afi_supported[match_afi.group('address_family')]: { 
+                                "received_prefixes": int(match_peer.group('received_prefixes')), 
+                                #"accepted_prefixes": "Unknown", 
+                                "accepted_prefixes": int(match_accepted_routes.group('accepted_routes')),
+                                "sent_prefixes": int(match_peer.group('adv_prefixes')) 
+                                           }
+                                        }
+                               }
+                            })
+             
+            elif match_afi is not None and any((s in match_afi.group('address_family') for s in ['Vpnv4 All','Vpnv6 All'])):
+                if bgp_neighbors['global'] is False:
+                    bgp_neighbors.update({"global": {"router_id": bgp_global_router_id, "peers" : {}}})
+    
+                #Separation of VPNs
+                vpn_instance_list = re.split(re_vpn_instance_separator, afi, flags=re.M)
+                 
+                for vpn_peers in vpn_instance_list:
+                
+                    if "VPN-Instance " not in vpn_peers:
+                        for peer in vpn_peers.splitlines():
+                            match_peer = re.search(re_peers, peer, flags=re.M)
+                            if match_peer:
+                            
+                                if bgp_neighbors["global"]["peers"][match_peer.group('peer_ip')]:
+                                   bgp_neighbors["global"]["peers"][match_peer.group('peer_ip')]["address_family"].update(
+                                   { 
+                                    afi_supported[match_afi.group('address_family')]: { 
+                                        "received_prefixes": int(match_peer.group('received_prefixes')), 
+                                        "accepted_prefixes": "Unknown", 
+                                        "sent_prefixes": int(match_peer.group('adv_prefixes')) 
+                                                   }
+                                                }
+                                   ) 
+                                else:
+                                
+                                    peer_bgp_command = ""
+                                    if "Ipv6" in match_afi.group('address_family'):
+                                        peer_bgp_command = "display bgp ipv6 peer {} verbose".format(match_peer.group('peer_ip'))
+                                    else:
+                                        peer_bgp_command = "display bgp peer {} verbose".format(match_peer.group('peer_ip'))            
+                                    peer_detail = self.device.send_command(peer_bgp_command)
+    
+                                    match_remote_rid = re.search(re_remote_rid, peer_detail, flags=re.M)
+                                    match_peer_description = re.search(re_peer_description, peer_detail, flags=re.M)
+                                     
+                                    bgp_neighbors["global"]["peers"].update( { 
+                                    match_peer.group('peer_ip'): { 
+                                    "local_as": int(bgp_global_local_as), 
+                                    "remote_as": int(match_peer.group('as')), 
+                                    "remote_id": "" if match_remote_rid is None else match_remote_rid.group('remote_rid'), 
+                                    "is_up": True if "Established" in match_peer.group('state') else False, 
+                                    "is_enabled": False if "Admin" in match_peer.group('state') else True, 
+                                    "description": "" if match_peer_description is None else match_peer_description.group('peer_description'), 
+                                    "uptime": int(self.bgp_time_conversion(match_peer.group('updown_time'))), 
+                                    "address_family": { 
+                                       afi_supported[match_afi.group('address_family')]: { 
+                                            "received_prefixes": int(match_peer.group('received_prefixes')), 
+                                            "accepted_prefixes": "Unknown", 
+                                            "sent_prefixes": int(match_peer.group('adv_prefixes')) 
+                                                       }
+                                                    }
+                                           }
+                                        })
+                    else:
+                        match_vrf_router_id = re.search(re_vrf_router_id, vpn_peers, flags=re.M)
+    
+                        if match_vrf_router_id is None:
+                            msg = "No Match Found"
+                            raise ValueError(msg)
+    
+                        peer_vpn_instance = match_vrf_router_id.group('vrf')
+                        peer_router_id = match_vrf_router_id.group('vrf_router_id')
+    
+                        bgp_neighbors.update({peer_vpn_instance: {
+                                        "router_id": peer_router_id, "peers" : {}}})
+    
+                        for peer in vpn_peers.splitlines():
+                                     
+                            match_peer = re.search(re_peers, peer, flags=re.M)
+                            if match_peer:
+                            
+                                peer_bgp_command = ""
+                                afi_vrf = ""
+                                if "Ipv6" in match_afi.group('address_family'):
+                                    peer_bgp_command = "display bgp ipv6 peer {} verbose".format(match_peer.group('peer_ip'))
+                                    afi_vrf = "ipv6 unicast"
+                                else:
+                                    peer_bgp_command = "display bgp peer {} verbose".format(match_peer.group('peer_ip'))
+                                    afi_vrf = "ipv4 unicast"
+                                 
+                                peer_detail = self.device.send_command(peer_bgp_command)
+    
+                                match_remote_rid = re.search(re_remote_rid, peer_detail, flags=re.M)
+                                match_peer_description = re.search(re_peer_description, peer_detail, flags=re.M)
+    
+                                bgp_neighbors[peer_vpn_instance]["peers"].update( { 
+                                match_peer.group('peer_ip'): { 
+                                "local_as": int(bgp_global_local_as), 
+                                "remote_as": int(match_peer.group('as')), 
+                                "remote_id": "" if match_remote_rid is None else match_remote_rid.group('remote_rid'), 
+                                "is_up": True if "Established" in match_peer.group('state') else False, 
+                                "is_enabled": False if "Admin" in match_peer.group('state') else True, 
+                                "description": "" if match_peer_description is None else match_peer_description.group('peer_description'), 
+                                "uptime": int(self.bgp_time_conversion(match_peer.group('updown_time'))),         
+                                "address_family": { 
+                                    afi_vrf: { 
+                                        "received_prefixes": int(match_peer.group('received_prefixes')), 
+                                        "accepted_prefixes": "Unknown", 
+                                        "sent_prefixes": int(match_peer.group('adv_prefixes')) 
+                                                   }
+                                                }
+                                       }
+                                    })
+        return bgp_neighbors
+
     # develop
     def get_lldp_neighbors_detail(self, interface=""):
         pass
